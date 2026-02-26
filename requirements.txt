@@ -1,0 +1,13 @@
+# ============================================================================
+# Multi-Agent Research System — Dependencies
+# ============================================================================
+# LangGraph:       Orchestration framework for building stateful agent graphs
+# LangChain:       Core abstractions (messages, tools, prompts) used by LangGraph
+# langchain-openai: OpenAI integration for LLM calls (GPT-4o, etc.)
+# python-dotenv:   Load environment variables from .env file
+# ============================================================================
+
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+python-dotenv>=1.0.0
