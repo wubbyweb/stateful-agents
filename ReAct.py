@@ -2,9 +2,14 @@
 ReAct Agent — Built from scratch to understand the fundamentals.
 This agent can reason about tasks and use tools to accomplish them.
 """
+
 from openai import OpenAI
 
-client = OpenAI()
+client = OpenAI(
+    base_url="http://localhost:11434/v1",
+    api_key="ollama"
+)
+
 
 # ── System prompt that teaches the LLM the ReAct pattern ──────────
 REACT_SYSTEM_PROMPT = """You are an AI assistant that uses the ReAct
@@ -63,7 +68,7 @@ def run_react_agent(user_query: str, max_steps: int = 10) -> str:
     for step in range(max_steps):
         # ── THINK + ACT: Ask the LLM what to do ──
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="llama3:8b",
             messages=messages,
             temperature=0,
         )
