@@ -42,6 +42,7 @@ import argparse
 import os
 import sys
 import json
+import uuid
 from datetime import datetime
 
 # ── Load environment variables from .env file ─────────────────────
@@ -102,7 +103,8 @@ def print_section(title: str, content: str = "", emoji: str = "📌"):
         print()
 
 
-def run_pipeline(topic: str, dry_run: bool = True):
+def run_pipeline(topic: str, dry_run: bool = True,
+                 thread_id: str | None = None):
     """
     Execute the full multi-agent research pipeline.
 
@@ -114,9 +116,11 @@ def run_pipeline(topic: str, dry_run: bool = True):
     5. Saves the final report
 
     Args:
-        topic:   The research topic to investigate.
-        dry_run: If True, uses simulated data (no OpenAI API needed).
-                 If False, requires OPENAI_API_KEY environment variable.
+        topic:     The research topic to investigate.
+        dry_run:   If True, uses simulated data (no OpenAI API needed).
+                   If False, requires OPENAI_API_KEY environment variable.
+        thread_id: Optional unique execution ID. If None, a new UUID is
+                   generated. Use a previous thread_id to resume context.
 
     The dry_run flag is key for learning — it lets you study the
     entire multi-agent pipeline without needing an API key or
@@ -131,7 +135,10 @@ def run_pipeline(topic: str, dry_run: bool = True):
     # to enable cross-session learning.
     print_section("PHASE 1: Initializing Memory System", emoji="🧠")
 
-    memory = AgentMemory(max_short_term=100)
+    memory = AgentMemory(max_short_term=100, thread_id=thread_id)
+
+    print(f"  🔑 Thread ID: {memory.thread_id}")
+    print(f"  🔗 Backends:  {memory.backend_status}")
 
     # ── Seed long-term memory with baseline knowledge ─────────────
     # Pre-loading some facts simulates a system that has learned from
@@ -165,7 +172,8 @@ def run_pipeline(topic: str, dry_run: bool = True):
 
     initial_state = create_initial_state(
         topic=topic,
-        memory_snapshot=memory.to_dict()
+        memory_snapshot=memory.to_dict(),
+        thread_id=memory.thread_id,
     )
 
     print(f"  📌 Research topic: '{topic}'")
@@ -380,6 +388,14 @@ Examples:
         help="Run with real OpenAI API calls (requires OPENAI_API_KEY). "
              "Overrides --dry-run."
     )
+    parser.add_argument(
+        "--thread-id",
+        type=str,
+        default=None,
+        help="Unique execution/thread ID for context isolation. "
+             "Reuse a previous ID to resume that conversation. "
+             "If omitted a new UUID is generated."
+    )
     return parser.parse_args()
 
 
@@ -421,7 +437,7 @@ if __name__ == "__main__":
     print(f"\n  🎯 Starting research on: '{topic}'")
     print(f"  ⏰ Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    run_pipeline(topic=topic, dry_run=dry_run)
+    run_pipeline(topic=topic, dry_run=dry_run, thread_id=args.thread_id)
 
     # ── Done ──────────────────────────────────────────────────────
     print(f"\n  ✅ Pipeline complete at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

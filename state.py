@@ -140,12 +140,16 @@ class WorkflowState(TypedDict):
     iteration: int             # Current revision loop count (0-based)
     quality_score: float       # Report quality rating (1-10)
 
-    # ── Observability ─────────────────────────────────────────────
+    # ── Context isolation ─────────────────────────────────────
+    thread_id: str             # Unique execution/conversation identifier
+
+    # ── Observability ─────────────────────────────────────────
     actions_taken: list[str]   # Log of all actions for traceability
     current_agent: str         # Name of the currently executing agent
 
 
-def create_initial_state(topic: str, memory_snapshot: dict = None) -> dict:
+def create_initial_state(topic: str, memory_snapshot: dict = None,
+                         thread_id: str = "") -> dict:
     """
     Create the initial state for a new workflow execution.
 
@@ -157,6 +161,8 @@ def create_initial_state(topic: str, memory_snapshot: dict = None) -> dict:
         topic:           The research topic provided by the user.
         memory_snapshot: Optional pre-existing memory to load (e.g.,
                         from a previous session). If None, starts fresh.
+        thread_id:       Unique execution/conversation ID for context
+                        isolation across distributed backends.
 
     Returns:
         A dictionary matching the WorkflowState schema, ready to be
@@ -165,7 +171,8 @@ def create_initial_state(topic: str, memory_snapshot: dict = None) -> dict:
     Example:
         state = create_initial_state(
             topic="AI agents in healthcare",
-            memory_snapshot=None  # Fresh start
+            memory_snapshot=None,  # Fresh start
+            thread_id="abc-123",
         )
         result = graph.invoke(state)
     """
@@ -197,6 +204,9 @@ def create_initial_state(topic: str, memory_snapshot: dict = None) -> dict:
 
         # No quality score yet — the Reviewer will set this
         "quality_score": 0.0,
+
+        # Unique execution context for distributed backend isolation
+        "thread_id": thread_id,
 
         # Action log starts empty
         "actions_taken": [],

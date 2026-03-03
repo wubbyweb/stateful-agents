@@ -1,106 +1,395 @@
 """
 ============================================================================
-memory.py — Three-Tier Agent Memory System
+memory.py — Distributed Three-Tier Agent Memory System
 ============================================================================
 
 PURPOSE:
-    This module implements a dynamic memory system that agents share during
-    workflow execution. It demonstrates how stateful agents maintain context,
-    learn facts, and recall past experiences.
+    This module implements a production-grade memory system for multi-agent
+    workflows. It supports three backends — Azure Cache for Redis (caching),
+    Azure Cosmos DB via the MongoDB API (durable persistence), and a local
+    in-process fallback — wired together behind the same AgentMemory API
+    that the rest of the codebase already uses.
+
+WHY DISTRIBUTED?
+    Local in-memory state (deque / dict / list) is fine for a single-process
+    demo, but in production you need:
+      • Persistence across process restarts
+      • Sub-millisecond caching for "hot" working memory (Redis)
+      • Durable, indexed storage for long-term facts & episodic logs (Cosmos)
+      • Concurrent agent isolation via unique thread/execution IDs
 
 ARCHITECTURE:
-    The memory has three tiers, inspired by human cognition:
+    ┌──────────────────────────────────────────────────────────────────┐
+    │                        AgentMemory                              │
+    │                   (thread_id scoped)                            │
+    │                                                                  │
+    │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │
+    │  │ SHORT-TERM       │  │ LONG-TERM        │  │ EPISODIC      │  │
+    │  │ (Redis cache)    │  │ (Cosmos MongoDB) │  │ (Cosmos)      │  │
+    │  │                  │  │                  │  │               │  │
+    │  │ Current working  │  │ Persistent facts │  │ Task history  │  │
+    │  │ memory, TTL-     │  │ indexed by key   │  │ with outcomes │  │
+    │  │ managed eviction │  │ + thread_id      │  │ + scores      │  │
+    │  └──────────────────┘  └──────────────────┘  └───────────────┘  │
+    │                                                                  │
+    │  ┌──────────────────────────────────────────────────────────────┐│
+    │  │              LOCAL FALLBACK (in-process)                     ││
+    │  │  Activates automatically when Redis / Cosmos are unreachable ││
+    │  └──────────────────────────────────────────────────────────────┘│
+    └──────────────────────────────────────────────────────────────────┘
 
-    ┌─────────────────────────────────────────────────────────┐
-    │                    AgentMemory                          │
-    │                                                        │
-    │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
-    │  │  SHORT-TERM  │  │  LONG-TERM   │  │   EPISODIC   │  │
-    │  │  (working)   │  │  (knowledge) │  │  (experience)│  │
-    │  │              │  │              │  │              │  │
-    │  │  Current     │  │  Persistent  │  │  Past task   │  │
-    │  │  task data,  │  │  facts the   │  │  records     │  │
-    │  │  recent      │  │  agent has   │  │  with        │  │
-    │  │  observations│  │  learned     │  │  outcomes    │  │
-    │  └──────────────┘  └──────────────┘  └──────────────┘  │
-    └─────────────────────────────────────────────────────────┘
+THREAD ID ISOLATION:
+    Every memory key is prefixed with a `thread_id`.  Different
+    conversations / executions / tasks get their own isolated namespace
+    so concurrent pipelines never collide.
 
-WHY THREE TIERS?
-    - Short-term memory is fast but limited — it holds only what's needed
-      RIGHT NOW (like your mental "scratchpad" while solving a problem).
-    - Long-term memory persists across tasks — facts learned in one task
-      are available in the next (like remembering a colleague's name).
-    - Episodic memory records complete task outcomes — the agent can look
-      back at what worked and what didn't (like learning from experience).
-
-USAGE IN THIS PROJECT:
-    - The Research Agent writes search results to short-term memory.
-    - The Analysis Agent reads short-term memory and stores discovered
-      trends in long-term memory.
-    - The Writer Agent checks episodic memory for past report formats
-      that were well-received.
-    - All agents share the SAME memory instance via the workflow state.
+ENVIRONMENT VARIABLES (see .env.example):
+    AZURE_COSMOS_CONNECTION_STRING   – MongoDB-compatible connection string
+    AZURE_COSMOS_DATABASE            – database name (default: agent_memory)
+    AZURE_REDIS_HOST                 – hostname for Azure Cache for Redis
+    AZURE_REDIS_PORT                 – port (default: 6380)
+    AZURE_REDIS_PASSWORD             – access key
+    AZURE_REDIS_SSL                  – "true" for TLS (default: true)
 
 ============================================================================
 """
 
-from datetime import datetime
-from collections import deque
-from typing import Any
-import json
+from __future__ import annotations
 
+import json
+import logging
+import os
+import uuid
+from collections import deque
+from datetime import datetime
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── Optional imports — graceful degradation if libraries aren't installed ──
+try:
+    import redis
+    _REDIS_AVAILABLE = True
+except ImportError:
+    _REDIS_AVAILABLE = False
+    logger.info("redis-py not installed — Redis backend unavailable.")
+
+try:
+    from pymongo import MongoClient
+    from pymongo.errors import ConnectionFailure
+    _COSMOS_AVAILABLE = True
+except ImportError:
+    _COSMOS_AVAILABLE = False
+    logger.info("pymongo not installed — Cosmos DB backend unavailable.")
+
+
+# ============================================================================
+# BACKEND HELPERS
+# ============================================================================
+
+class _RedisBackend:
+    """
+    Thin wrapper around Azure Cache for Redis.
+
+    All keys are namespaced by thread_id to ensure concurrent pipelines
+    never overlap.  Short-term memory items are stored as a Redis List
+    (bounded via LTRIM), while long-term and episodic data use Redis
+    only as a write-through cache with configurable TTL.
+    """
+
+    def __init__(self, thread_id: str):
+        self.thread_id = thread_id
+        self._client: Optional["redis.Redis"] = None
+        self._connected = False
+
+        host = os.getenv("AZURE_REDIS_HOST", "")
+        port = int(os.getenv("AZURE_REDIS_PORT", "6380"))
+        password = os.getenv("AZURE_REDIS_PASSWORD", "")
+        use_ssl = os.getenv("AZURE_REDIS_SSL", "true").lower() == "true"
+
+        if not host or not _REDIS_AVAILABLE:
+            logger.info("Redis backend: no host configured or redis-py "
+                        "missing — skipping.")
+            return
+
+        try:
+            self._client = redis.Redis(
+                host=host,
+                port=port,
+                password=password,
+                ssl=use_ssl,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
+            )
+            self._client.ping()
+            self._connected = True
+            logger.info("Redis backend: connected to %s:%s", host, port)
+        except Exception as exc:
+            logger.warning("Redis backend: could not connect — %s", exc)
+            self._client = None
+
+    # ── key helpers ────────────────────────────────────────────────
+    def _key(self, namespace: str) -> str:
+        return f"agent_memory:{self.thread_id}:{namespace}"
+
+    @property
+    def connected(self) -> bool:
+        return self._connected and self._client is not None
+
+    # ── Short-term (list) ─────────────────────────────────────────
+    def push_short_term(self, item: dict, max_len: int = 100) -> None:
+        if not self.connected:
+            return
+        key = self._key("short_term")
+        self._client.rpush(key, json.dumps(item))
+        self._client.ltrim(key, -max_len, -1)
+
+    def get_short_term(self) -> list[dict]:
+        if not self.connected:
+            return []
+        raw = self._client.lrange(self._key("short_term"), 0, -1)
+        return [json.loads(r) for r in raw]
+
+    # ── Long-term (hash) ──────────────────────────────────────────
+    def set_long_term(self, key: str, entry: dict) -> None:
+        if not self.connected:
+            return
+        self._client.hset(self._key("long_term"), key, json.dumps(entry))
+
+    def get_long_term(self, key: str) -> Optional[dict]:
+        if not self.connected:
+            return None
+        raw = self._client.hget(self._key("long_term"), key)
+        return json.loads(raw) if raw else None
+
+    def get_all_long_term(self) -> dict[str, dict]:
+        if not self.connected:
+            return {}
+        raw_all = self._client.hgetall(self._key("long_term"))
+        return {k: json.loads(v) for k, v in raw_all.items()}
+
+    # ── Episodic (list) ───────────────────────────────────────────
+    def push_episodic(self, episode: dict) -> None:
+        if not self.connected:
+            return
+        self._client.rpush(self._key("episodic"), json.dumps(episode))
+
+    def get_all_episodic(self) -> list[dict]:
+        if not self.connected:
+            return []
+        raw = self._client.lrange(self._key("episodic"), 0, -1)
+        return [json.loads(r) for r in raw]
+
+
+class _CosmosBackend:
+    """
+    Thin wrapper around Azure Cosmos DB (MongoDB API).
+
+    Three collections mirror the three memory tiers:
+      • short_term  – working observations (secondary durability)
+      • long_term   – persistent facts
+      • episodic    – task execution history
+
+    Every document contains a `thread_id` field that is indexed for
+    fast per-conversation lookups.
+    """
+
+    def __init__(self, thread_id: str):
+        self.thread_id = thread_id
+        self._db = None
+        self._connected = False
+
+        conn_str = os.getenv("AZURE_COSMOS_CONNECTION_STRING", "")
+        db_name = os.getenv("AZURE_COSMOS_DATABASE", "agent_memory")
+
+        if not conn_str or not _COSMOS_AVAILABLE:
+            logger.info("Cosmos DB backend: no connection string or "
+                        "pymongo missing — skipping.")
+            return
+
+        try:
+            client = MongoClient(
+                conn_str,
+                serverSelectionTimeoutMS=5000,
+                retryWrites=False,      # Cosmos DB MongoDB API constraint
+            )
+            # Verify connectivity
+            client.admin.command("ping")
+            self._db = client[db_name]
+
+            # Ensure indexes on thread_id for every collection
+            for coll_name in ("short_term", "long_term", "episodic"):
+                self._db[coll_name].create_index("thread_id")
+
+            self._connected = True
+            logger.info("Cosmos DB backend: connected to database '%s'",
+                        db_name)
+        except Exception as exc:
+            logger.warning("Cosmos DB backend: could not connect — %s", exc)
+            self._db = None
+
+    @property
+    def connected(self) -> bool:
+        return self._connected and self._db is not None
+
+    # ── Short-term ────────────────────────────────────────────────
+    def insert_short_term(self, item: dict) -> None:
+        if not self.connected:
+            return
+        doc = {**item, "thread_id": self.thread_id}
+        self._db["short_term"].insert_one(doc)
+
+    def get_short_term(self, limit: int = 100) -> list[dict]:
+        if not self.connected:
+            return []
+        cursor = (
+            self._db["short_term"]
+            .find({"thread_id": self.thread_id})
+            .sort("timestamp", 1)
+            .limit(limit)
+        )
+        return [{k: v for k, v in doc.items() if k != "_id"}
+                for doc in cursor]
+
+    # ── Long-term ─────────────────────────────────────────────────
+    def upsert_long_term(self, key: str, entry: dict) -> None:
+        if not self.connected:
+            return
+        self._db["long_term"].update_one(
+            {"thread_id": self.thread_id, "key": key},
+            {"$set": {**entry, "thread_id": self.thread_id, "key": key}},
+            upsert=True,
+        )
+
+    def get_long_term(self, key: str) -> Optional[dict]:
+        if not self.connected:
+            return None
+        doc = self._db["long_term"].find_one(
+            {"thread_id": self.thread_id, "key": key}
+        )
+        if doc:
+            return {k: v for k, v in doc.items()
+                    if k not in ("_id", "thread_id", "key")}
+        return None
+
+    def get_all_long_term(self) -> dict[str, dict]:
+        if not self.connected:
+            return {}
+        cursor = self._db["long_term"].find(
+            {"thread_id": self.thread_id}
+        )
+        result = {}
+        for doc in cursor:
+            key = doc.get("key", "")
+            result[key] = {k: v for k, v in doc.items()
+                           if k not in ("_id", "thread_id", "key")}
+        return result
+
+    # ── Episodic ──────────────────────────────────────────────────
+    def insert_episodic(self, episode: dict) -> None:
+        if not self.connected:
+            return
+        doc = {**episode, "thread_id": self.thread_id}
+        self._db["episodic"].insert_one(doc)
+
+    def get_all_episodic(self) -> list[dict]:
+        if not self.connected:
+            return []
+        cursor = (
+            self._db["episodic"]
+            .find({"thread_id": self.thread_id})
+            .sort("timestamp", 1)
+        )
+        return [{k: v for k, v in doc.items() if k != "_id"}
+                for doc in cursor]
+
+
+# ============================================================================
+# MAIN CLASS
+# ============================================================================
 
 class AgentMemory:
     """
-    A shared memory system for multi-agent collaboration.
+    A distributed, thread-isolated memory system for multi-agent collaboration.
 
-    This class is the central knowledge store that all agents in the workflow
-    can read from and write to. It's injected into the LangGraph state so
-    every node (agent) has access to the same memory instance.
+    Backends:
+        1. Redis  – ultra-low-latency cache for short-term / hot data
+        2. Cosmos – durable persistence for long-term facts & episodes
+        3. Local  – automatic in-process fallback if cloud services are down
+
+    Every public method writes to ALL available backends (write-through).
+    Reads prefer Redis → Cosmos → local, falling back transparently.
 
     Attributes:
-        short_term (deque):  Bounded working memory for the current task.
-        long_term (dict):    Unbounded persistent knowledge base.
-        episodic (list):     Log of past task executions and their outcomes.
+        thread_id  (str):   Unique execution / conversation identifier.
+        short_term (deque): Bounded working memory for the current task.
+        long_term  (dict):  Unbounded persistent knowledge base.
+        episodic   (list):  Log of past task executions and their outcomes.
     """
 
-    def __init__(self, max_short_term: int = 100):
+    def __init__(
+        self,
+        max_short_term: int = 100,
+        thread_id: str | None = None,
+    ):
         """
-        Initialize the three memory tiers.
+        Initialize the three memory tiers and connect to backends.
 
         Args:
             max_short_term: Maximum number of items in working memory.
-                           When full, the oldest item is automatically
-                           evicted (FIFO via deque). This prevents memory
-                           from growing unbounded during long tasks.
+            thread_id:      Unique identifier for this execution context.
+                            If not provided, a new UUID is generated so
+                            that every run is isolated by default.
         """
-        # ── SHORT-TERM MEMORY ─────────────────────────────────────
-        # A bounded queue that holds recent observations, intermediate
-        # results, and context for the current task. Using a deque with
-        # maxlen ensures automatic eviction of the oldest items when
-        # capacity is reached — no manual cleanup needed.
+        # ── Execution isolation ───────────────────────────────────
+        self.thread_id: str = thread_id or str(uuid.uuid4())
+
+        # ── LOCAL TIERS (always available) ────────────────────────
         self.short_term: deque[dict] = deque(maxlen=max_short_term)
-
-        # ── LONG-TERM MEMORY ──────────────────────────────────────
-        # A dictionary that stores persistent facts the agent has learned.
-        # Unlike short-term memory, this is unbounded and survives across
-        # tasks. Each entry tracks when it was learned and how often it
-        # has been accessed (useful for measuring knowledge utilization).
         self.long_term: dict[str, dict] = {}
-
-        # ── EPISODIC MEMORY ───────────────────────────────────────
-        # A chronological log of past task executions. Each episode
-        # records what the task was, what actions were taken, and whether
-        # the outcome was successful. This allows the agent to "learn
-        # from experience" — e.g., avoiding strategies that failed before.
         self.episodic: list[dict] = []
+        self._max_short_term = max_short_term
+
+        # ── DISTRIBUTED BACKENDS ──────────────────────────────────
+        self._redis = _RedisBackend(self.thread_id)
+        self._cosmos = _CosmosBackend(self.thread_id)
+
+        # On init, hydrate local state FROM distributed stores so the
+        # in-process view is always up-to-date.
+        self._hydrate_from_backends()
+
+    # ────────────────────────────────────────────────────────────────
+    # HYDRATION — populate local state from distributed stores
+    # ────────────────────────────────────────────────────────────────
+
+    def _hydrate_from_backends(self) -> None:
+        """
+        Pull any existing data for this thread_id from Redis / Cosmos
+        into the local in-process structures.  Precedence:
+          Redis (fastest) → Cosmos (durable) → leave empty.
+        """
+        # -- Short-term --
+        items = self._redis.get_short_term()
+        if not items:
+            items = self._cosmos.get_short_term(self._max_short_term)
+        for item in items:
+            self.short_term.append(item)
+
+        # -- Long-term --
+        lt = self._redis.get_all_long_term()
+        if not lt:
+            lt = self._cosmos.get_all_long_term()
+        self.long_term.update(lt)
+
+        # -- Episodic --
+        eps = self._redis.get_all_episodic()
+        if not eps:
+            eps = self._cosmos.get_all_episodic()
+        self.episodic.extend(eps)
 
     # ==================================================================
     # SHORT-TERM MEMORY OPERATIONS
-    # ==================================================================
-    # These methods manage the agent's "working memory" — the scratchpad
-    # for the current task. Items are tagged with timestamps and metadata
-    # so agents can filter by recency or source.
     # ==================================================================
 
     def remember(self, content: str, source: str = "system",
@@ -108,127 +397,97 @@ class AgentMemory:
         """
         Add an observation or fact to short-term working memory.
 
-        This is the most frequently called memory operation. Agents use it
-        to store intermediate results (e.g., "Search returned 5 results
-        about quantum computing"), observations, or context that other
-        agents in the pipeline will need.
+        Writes to ALL available backends (local + Redis + Cosmos).
 
         Args:
             content:  The text content to remember.
-            source:   Which agent or system wrote this (for traceability).
-            metadata: Optional dictionary of extra data (e.g., confidence
-                      scores, source URLs, data types).
-
-        Example:
-            memory.remember(
-                content="Search found 3 articles about AI in healthcare",
-                source="research_agent",
-                metadata={"query": "AI healthcare", "result_count": 3}
-            )
+            source:   Which agent or system wrote this.
+            metadata: Optional extra data (confidence scores, URLs, etc.).
         """
-        self.short_term.append({
+        item = {
             "content": content,
             "source": source,
             "timestamp": datetime.now().isoformat(),
             "metadata": metadata or {},
-        })
+            "thread_id": self.thread_id,
+        }
+
+        # ── Local ──
+        self.short_term.append(item)
+
+        # ── Redis (fast cache) ──
+        self._redis.push_short_term(item, self._max_short_term)
+
+        # ── Cosmos (durable) ──
+        self._cosmos.insert_short_term(item)
 
     def get_recent_context(self, n: int = 10,
                            source_filter: str = None) -> list[str]:
         """
         Retrieve the N most recent items from working memory.
 
-        This is how agents "catch up" on what happened before them in
-        the pipeline. For example, the Analysis Agent calls this to read
-        all the search results the Research Agent stored.
-
         Args:
             n:             Number of recent items to retrieve.
             source_filter: If set, only return items from this source.
-                          Useful when an agent only wants its own notes.
 
         Returns:
             A list of content strings, most recent last.
         """
         items = list(self.short_term)
-
-        # ── Optional filtering by source ──
-        # In a multi-agent system, each agent writes to the same memory.
-        # Filtering lets an agent read only items from a specific source
-        # (e.g., only research results, not analysis notes).
         if source_filter:
-            items = [item for item in items if item["source"] == source_filter]
-
-        # Return only the content strings (not the full metadata dicts)
-        # to keep the LLM prompt clean and concise.
+            items = [i for i in items if i["source"] == source_filter]
         return [item["content"] for item in items[-n:]]
 
     def get_working_memory_summary(self) -> str:
-        """
-        Generate a human-readable summary of current working memory.
-
-        This is injected into agent prompts so the LLM knows what context
-        is available. Without this, the agent would be "blind" to what
-        other agents have done.
-
-        Returns:
-            A formatted string summarizing all items in working memory.
-        """
+        """Generate a human-readable summary of current working memory."""
         if not self.short_term:
             return "Working memory is empty — no prior context available."
 
         lines = []
         for i, item in enumerate(self.short_term, 1):
             lines.append(f"  [{i}] ({item['source']}) {item['content']}")
-        return f"Working Memory ({len(self.short_term)} items):\n" + "\n".join(lines)
+        return (f"Working Memory ({len(self.short_term)} items, "
+                f"thread={self.thread_id[:8]}…):\n" + "\n".join(lines))
 
     # ==================================================================
     # LONG-TERM MEMORY OPERATIONS
-    # ==================================================================
-    # These methods manage persistent knowledge. Unlike short-term memory,
-    # facts stored here are never evicted automatically. They represent
-    # "things the agent knows" that are reusable across tasks.
     # ==================================================================
 
     def learn(self, key: str, value: Any, source: str = "system") -> None:
         """
         Store a fact in long-term memory.
 
-        Long-term memory is organized as key-value pairs. Each entry also
-        tracks metadata: when it was learned, who wrote it, and how many
-        times it has been accessed. This metadata is useful for:
-          - Debugging (which agent learned this?)
-          - Analytics (which facts are most useful?)
-          - Conflict resolution (when was this last updated?)
+        Writes through to Redis (cache) AND Cosmos (durable).
 
         Args:
-            key:    A descriptive key for the fact (e.g., "top_ai_trend_2024").
-            value:  The fact itself (can be any type: str, dict, list, etc.).
+            key:    A descriptive key for the fact.
+            value:  The fact itself (any JSON-serialisable type).
             source: Which agent stored this fact.
-
-        Example:
-            memory.learn(
-                key="top_ai_trend_2024",
-                value="Agentic AI systems are the #1 trend",
-                source="analysis_agent"
-            )
         """
-        self.long_term[key] = {
+        entry = {
             "value": value,
             "source": source,
             "learned_at": datetime.now().isoformat(),
-            "access_count": 0,     # Tracks how often this fact is recalled
-            "last_accessed": None,  # Timestamp of most recent access
+            "access_count": 0,
+            "last_accessed": None,
+            "thread_id": self.thread_id,
         }
+
+        # ── Local ──
+        self.long_term[key] = entry
+
+        # ── Redis cache ──
+        self._redis.set_long_term(key, entry)
+
+        # ── Cosmos durable ──
+        self._cosmos.upsert_long_term(key, entry)
 
     def recall(self, key: str) -> Any:
         """
         Retrieve a fact from long-term memory by its key.
 
-        Every recall increments the access counter and updates the
-        last_accessed timestamp. This usage tracking helps identify:
-          - Frequently used facts (high value — keep them)
-          - Never-accessed facts (low value — maybe prune them)
+        Increments the access counter and updates last_accessed.
+        Writes the updated entry back to all backends.
 
         Args:
             key: The key of the fact to retrieve.
@@ -238,11 +497,13 @@ class AgentMemory:
         """
         if key in self.long_term:
             entry = self.long_term[key]
-            # ── Track access patterns ──
-            # This is a simple form of "memory reinforcement" — the more
-            # a fact is accessed, the more "important" it is considered.
             entry["access_count"] += 1
             entry["last_accessed"] = datetime.now().isoformat()
+
+            # Propagate usage stats to distributed stores
+            self._redis.set_long_term(key, entry)
+            self._cosmos.upsert_long_term(key, entry)
+
             return entry["value"]
         return None
 
@@ -250,41 +511,29 @@ class AgentMemory:
         """
         Retrieve ALL facts from long-term memory.
 
-        Used when an agent needs a complete knowledge dump — for example,
-        the Writer Agent wants to incorporate all learned facts into the
-        final report.
-
         Returns:
             A dictionary mapping keys to their stored values.
         """
-        return {key: entry["value"] for key, entry in self.long_term.items()}
+        return {key: entry["value"]
+                for key, entry in self.long_term.items()}
 
     def get_knowledge_summary(self) -> str:
-        """
-        Generate a human-readable summary of all long-term knowledge.
-
-        This is injected into agent prompts so they know what facts have
-        been learned by previous agents in the pipeline.
-
-        Returns:
-            A formatted string listing all known facts.
-        """
+        """Generate a human-readable summary of all long-term knowledge."""
         if not self.long_term:
             return "Long-term memory is empty — no facts learned yet."
 
         lines = []
         for key, entry in self.long_term.items():
-            lines.append(f"  • {key}: {entry['value']} "
-                         f"(by {entry['source']}, "
-                         f"accessed {entry['access_count']}x)")
-        return f"Known Facts ({len(self.long_term)} items):\n" + "\n".join(lines)
+            lines.append(
+                f"  • {key}: {entry['value']} "
+                f"(by {entry['source']}, "
+                f"accessed {entry['access_count']}x)"
+            )
+        return (f"Known Facts ({len(self.long_term)} items, "
+                f"thread={self.thread_id[:8]}…):\n" + "\n".join(lines))
 
     # ==================================================================
     # EPISODIC MEMORY OPERATIONS
-    # ==================================================================
-    # These methods manage the agent's "experience log" — a record of
-    # complete task executions. This is analogous to how humans remember
-    # past events: "Last time I tried X, the result was Y."
     # ==================================================================
 
     def record_episode(self, task: str, actions: list[str],
@@ -293,59 +542,51 @@ class AgentMemory:
         """
         Record a complete task execution as an episode.
 
-        After a workflow completes (successfully or not), this method
-        logs the entire experience. Future runs can query this log to
-        learn from past successes and failures.
+        Writes through to Redis AND Cosmos.
 
         Args:
             task:          Description of the task that was executed.
             actions:       List of actions/tools used during the task.
             outcome:       Description of the final result.
             success:       Whether the task was completed successfully.
-            quality_score: A 1-10 quality rating (from the reviewer agent).
-
-        Example:
-            memory.record_episode(
-                task="Research AI trends for Q4 report",
-                actions=["search_web", "query_database", "analyze_trends"],
-                outcome="Generated 2-page report with 5 key findings",
-                success=True,
-                quality_score=8.5
-            )
+            quality_score: A 1-10 quality rating.
         """
-        self.episodic.append({
+        episode = {
             "task": task,
             "actions": actions,
             "outcome": outcome,
             "success": success,
             "quality_score": quality_score,
             "timestamp": datetime.now().isoformat(),
-        })
+            "thread_id": self.thread_id,
+        }
+
+        # ── Local ──
+        self.episodic.append(episode)
+
+        # ── Redis ──
+        self._redis.push_episodic(episode)
+
+        # ── Cosmos ──
+        self._cosmos.insert_episodic(episode)
 
     def find_similar_episodes(self, task_description: str) -> list[dict]:
         """
         Search episodic memory for tasks similar to the given description.
 
-        This is a simple keyword-based similarity search. In a production
-        system, you would use embedding-based similarity (e.g., cosine
-        similarity on sentence embeddings) for much better results.
+        Uses simple keyword overlap.  In production, replace with
+        embedding-based similarity search (e.g., Cosmos vector search).
 
         Args:
             task_description: Description of the current task.
 
         Returns:
-            A list of past episodes that share keywords with the task.
+            Past episodes that share ≥ 2 keywords with the description.
         """
-        # ── Simple keyword matching ──
-        # Split the task description into individual words and check
-        # if any of them appear in past episode task descriptions.
-        # This is a "good enough" approach for demonstration — production
-        # systems should use vector similarity search (e.g., FAISS, Pinecone).
         keywords = set(task_description.lower().split())
         similar = []
         for episode in self.episodic:
             episode_keywords = set(episode["task"].lower().split())
-            # If at least 2 keywords overlap, consider it "similar"
             if len(keywords & episode_keywords) >= 2:
                 similar.append(episode)
         return similar
@@ -353,9 +594,6 @@ class AgentMemory:
     def get_success_rate(self) -> float:
         """
         Calculate the overall success rate from episodic memory.
-
-        This metric helps monitor agent performance over time. A dropping
-        success rate might indicate prompt degradation or tool failures.
 
         Returns:
             A float between 0.0 and 1.0 representing the success ratio.
@@ -370,7 +608,7 @@ class AgentMemory:
         Calculate the average quality score across all episodes.
 
         Returns:
-            Average quality score (0.0-10.0), or 0.0 if no episodes exist.
+            Average quality score (0.0-10.0), or 0.0 if none.
         """
         scored = [ep for ep in self.episodic if ep["quality_score"] > 0]
         if not scored:
@@ -378,16 +616,7 @@ class AgentMemory:
         return sum(ep["quality_score"] for ep in scored) / len(scored)
 
     def get_episodes_summary(self) -> str:
-        """
-        Generate a human-readable summary of past episodes.
-
-        This is injected into agent prompts so they can learn from past
-        executions — e.g., "Last time we researched this topic, we got
-        a quality score of 8/10 using strategy X."
-
-        Returns:
-            A formatted string summarizing all past episodes.
-        """
+        """Generate a human-readable summary of past episodes."""
         if not self.episodic:
             return "No past episodes recorded yet — this is the first run."
 
@@ -403,28 +632,26 @@ class AgentMemory:
         rate = self.get_success_rate()
         avg_q = self.get_average_quality()
         header = (f"Past Episodes ({len(self.episodic)} total, "
-                  f"{rate:.0%} success rate, avg quality: {avg_q:.1f}/10):")
+                  f"{rate:.0%} success rate, avg quality: {avg_q:.1f}/10, "
+                  f"thread={self.thread_id[:8]}…):")
         return header + "\n" + "\n".join(lines)
 
     # ==================================================================
-    # SERIALIZATION
-    # ==================================================================
-    # These methods convert the memory to/from a dictionary so it can be
-    # stored in LangGraph's state (which must be JSON-serializable).
+    # SERIALIZATION  (LangGraph state ↔ AgentMemory)
     # ==================================================================
 
     def to_dict(self) -> dict:
         """
         Serialize the entire memory to a JSON-compatible dictionary.
 
-        LangGraph state must be serializable (for checkpointing and
-        persistence). This method converts all three memory tiers into
-        a plain dictionary that can be stored in the state.
+        Includes the thread_id so it can be round-tripped through
+        LangGraph state checkpointing.
 
         Returns:
-            A dictionary containing all memory data.
+            A dictionary containing all memory data + thread_id.
         """
         return {
+            "thread_id": self.thread_id,
             "short_term": list(self.short_term),
             "long_term": self.long_term,
             "episodic": self.episodic,
@@ -435,9 +662,8 @@ class AgentMemory:
         """
         Reconstruct an AgentMemory instance from a serialized dictionary.
 
-        This is the inverse of to_dict(). It's used when loading state
-        from a LangGraph checkpoint — the memory data is stored as a
-        dict in the state, and this method reconstructs the full object.
+        If a thread_id is present in *data* the same ID is reused so
+        distributed backends resume from the correct namespace.
 
         Args:
             data: A dictionary previously created by to_dict().
@@ -445,18 +671,41 @@ class AgentMemory:
         Returns:
             A fully populated AgentMemory instance.
         """
-        memory = cls()
+        thread_id = data.get("thread_id")
+        memory = cls(thread_id=thread_id)
+
+        # ── Overlay serialized data ──
+        # Clear whatever was hydrated from backends, then load from dict.
+        memory.short_term.clear()
         for item in data.get("short_term", []):
             memory.short_term.append(item)
         memory.long_term = data.get("long_term", {})
         memory.episodic = data.get("episodic", [])
         return memory
 
+    # ==================================================================
+    # CONVENIENCE / DIAGNOSTICS
+    # ==================================================================
+
+    @property
+    def backend_status(self) -> dict[str, bool]:
+        """Return connectivity status for each backend."""
+        return {
+            "local": True,
+            "redis": self._redis.connected,
+            "cosmos_db": self._cosmos.connected,
+        }
+
     def __repr__(self) -> str:
         """Concise string representation for debugging."""
+        backends = ", ".join(
+            name for name, ok in self.backend_status.items() if ok
+        )
         return (
             f"AgentMemory("
+            f"thread={self.thread_id[:8]}…, "
             f"short_term={len(self.short_term)} items, "
             f"long_term={len(self.long_term)} facts, "
-            f"episodic={len(self.episodic)} episodes)"
+            f"episodic={len(self.episodic)} episodes, "
+            f"backends=[{backends}])"
         )
