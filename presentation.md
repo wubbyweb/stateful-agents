@@ -44,7 +44,7 @@ AI Output: The capital of France is Paris.
 ```mermaid
 flowchart LR
     User((User)) -->|Query| Agent
-    Agent <-->|Reason + Call Tool| Tools[External Tools\n(APIs, Web, DB)]
+    Agent <-->|Reason + Call Tool| Tools[External Tools]
     Agent -->|Final Output| User
 ```
 
