@@ -94,21 +94,21 @@ The weather in Seattle is currently 75°F and sunny.
 
 ---
 
-## 3. Stateful Agents: The Need for Memory in Parallel Execution
+## 3. Stateful Agents: Orchestrating Multiple Agents
 
-When scaling Agentic AI, you will invariably run multiple agents—or serve multiple users—in **parallel**. If you rely on basic global variables or list-appending to track conversations, you will encounter race conditions and crossed data.
+In advanced Agentic AI, statefulness is crucial not just for remembering a single user's chat history, but for an **Orchestrator Agent** to manage and maintain the global state across multiple specialized worker agents. Instead of simply maintaining state for multiple separate users, the system must track complex, parallel executions of sub-agents (like a Researcher and a Coder) working together on a single larger task. If the orchestrator relies on basic global variables to track these sub-tasks, you will encounter race conditions and lost context.
 
-To solve this, we inject a **Checkpointer (Memory)** that associates the agent graph's *State* with a unique `thread_id`. The agent queries the state database before running, loads only the context for that thread, acts, and checkpoints the updated state back. 
+To solve this, we inject a **Checkpointer (Memory)** that associates the entire execution graph's *State* with a unique `thread_id` per complex task. The orchestrator queries the state database to see what sub-agents have completed, delegates new tasks, aggregates their results, and checkpoints the updated global state back.
 
 ### Architecture
 ```mermaid
 flowchart TD
-    UserA((User A)) -->|Thread 1| Agent
-    UserB((User B)) -->|Thread 2| Agent
-    UserC((User C)) -->|Thread 3| Agent
+    Task((Complex Task)) -->|Task Thread ID| Orchestrator
     
-    Agent((Orchestrator\nAgent)) <--> Memory[(Checkpointer\nState DB)]
-    Agent <--> LLM[LLM Backend]
+    Orchestrator((Orchestrator\nAgent)) <--> Memory[(Checkpointer\nGlobal State DB)]
+    Orchestrator <-->|Delegates & Collects| Agent1[Researcher Agent]
+    Orchestrator <-->|Delegates & Collects| Agent2[Coder Agent]
+    Orchestrator <-->|Delegates & Collects| Agent3[Reviewer Agent]
 ```
 
 ### Practical Code Snippet
@@ -119,28 +119,28 @@ from langchain_openai import ChatOpenAI
 
 llm = ChatOpenAI(model="gpt-4o")
 
-# 1. Initialize isolated memory checkpointer
+# 1. Initialize isolated memory checkpointer for the global state
 memory = MemorySaver()
 
-# 2. Create the agent backed by memory
-agent = create_react_agent(llm, tools=[], checkpointer=memory)
+# 2. Create the orchestrator agent backed by memory
+orchestrator = create_react_agent(llm, tools=[], checkpointer=memory)
 
-# 3. Define the thread (execution context) to ensure data isolation
-config = {"configurable": {"thread_id": "user_alice_session_1"}}
+# 3. Define the thread (execution context) for a complex multi-agent task
+config = {"configurable": {"thread_id": "task_build_website_001"}}
 
-print("--- Thread 1: First Request ---")
-result1 = agent.invoke(
-    {"messages": [("user", "Hi, I am Alice and my favorite color is Blue.")]},
+print("--- Step 1: Orchestrator delegates to Researcher ---")
+result1 = orchestrator.invoke(
+    {"messages": [("user", "We are building a website. Research the latest UI trends and save them to the state.")]},
     config=config
 )
 print(result1["messages"][-1].content)
 
-# In parallel, a totally different threat could be running...
+# The Orchestrator can now pause, wait for other parallel agents, or continue...
 
-print("\n--- Thread 1: Second Request (Leveraging Memory) ---")
-# The agent automatically pulls historical messages from "user_alice_session_1"
-result2 = agent.invoke(
-    {"messages": [("user", "What is my name and favorite color?")]},
+print("\n--- Step 2: Orchestrator delegates to Coder (Leveraging Global State) ---")
+# The orchestrator automatically pulls the global state (including the research) from "task_build_website_001"
+result2 = orchestrator.invoke(
+    {"messages": [("user", "Now, generate the HTML based on the UI trends we just researched.")]},
     config=config
 )
 print(result2["messages"][-1].content)
@@ -148,11 +148,11 @@ print(result2["messages"][-1].content)
 
 ### Sample Run Output
 ```text
---- Thread 1: First Request ---
-Hello Alice! It's great to meet you.
+--- Step 1: Orchestrator delegates to Researcher ---
+I have completed the research on the latest UI trends, focusing on dark mode and glassmorphism. I have saved these findings to our shared state.
 
---- Thread 1: Second Request (Leveraging Memory) ---
-Your name is Alice, and your favorite color is Blue!
+--- Step 2: Orchestrator delegates to Coder (Leveraging Global State) ---
+Using the previously researched trends (dark mode and glassmorphism), here is the HTML structure...
 ```
 
 ---
